@@ -1,11 +1,12 @@
 /* ==========================================================================
    Perfect Stranger — Research Board Generator
-   Paste research notes (headers + "- " bullets, Milanote-style) and get a
-   structured client research board. Runs entirely client-side (GitHub
-   Pages friendly, no backend, no API key).
+   Paste a research record (fixed JSON schema — the same shape an Airtable
+   base would hand back via its REST API) and get a structured client
+   research board. Runs entirely client-side (no backend, no API key).
    ========================================================================== */
 
 var STORAGE_KEY = 'psboard:data';
+var SOURCE_KEY = 'psboard:source';
 
 /* ---------------------------------------------------------------------- */
 /* HTML escaping — every field below can come from pasted user text, so   */
@@ -26,181 +27,46 @@ function safeUrl(url){
 }
 
 /* ==========================================================================
-   PARSER
-   Accepts loosely-structured notes:
-
-     Company Name (TICKER) — Status
-     Optional one-line mission/tagline
-
-     Section Header:
-     - bullet one
-     - Label: bullet with an explicit card title
-     - another bullet (Source: press)
-
-     Leadership:
-     - Name — Title — CONFIDENCE — Source
-     - * Name — Title — CONFIDENCE — Source | photo: https://... | link: https://...
-
-     Decision:
-     - Verdict sentence (pursue / pass / caution keywords drive the color)
-     - reasoning bullet
-     - reasoning bullet
-
-     Next Steps:
-     - step one
-     - step two
-
-   "Leadership", "Decision"/"Recommendation"/"Verdict", "Next Steps" and
-   "About"/"Overview"/"Company"/"Story" are pulled out into their own UI
-   blocks; every other header becomes a Milanote-style column.
+   TEXT HELPERS
+   Most fields are plain facts that end with an inline citation like
+   "...text... (Source: Label https://...)". These pull that apart so the
+   citation can render as an actual clickable link instead of dead text.
    ========================================================================== */
 
-var SPECIAL = {
-  leadership: /^leadership\b/i,
-  decision: /^(decision|recommendation|verdict)\b/i,
-  nextsteps: /^next\s*steps?\b/i,
-  about: /^(about|overview|company|story)\b/i
-};
-
-function parseFreeform(raw){
-  var lines = String(raw || '').replace(/\r\n/g, '\n').split('\n');
-  var headerRe = /^([^:\n]{2,80}):\s*$/;
-
-  var preamble = [];
-  var sections = [];
-  var current = null;
-  var sawHeader = false;
-
-  lines.forEach(function(rawLine){
-    var line = rawLine.trim();
-    if (!line) return;
-
-    var bulletMatch = line.match(/^[-•*]\s+(.*)$/);
-    var headerMatch = !bulletMatch && line.match(headerRe);
-
-    if (headerMatch) {
-      current = { header: headerMatch[1].trim(), bullets: [] };
-      sections.push(current);
-      sawHeader = true;
-    } else if (bulletMatch) {
-      if (!current) { current = { header: 'Notes', bullets: [] }; sections.push(current); }
-      current.bullets.push(bulletMatch[1].trim());
-    } else if (!sawHeader) {
-      preamble.push(line);
-    } else if (current && current.bullets.length) {
-      // wrapped continuation line — glue onto the previous bullet
-      current.bullets[current.bullets.length - 1] += ' ' + line;
-    }
-  });
-
-  // --- company header line: "Name (TICKER) — Status" ---
-  var nameLine = preamble[0] || '';
-  var tickerMatch = nameLine.match(/\(([^)]+)\)/);
-  var statusMatch = nameLine.match(/[—-]\s*([A-Za-z][A-Za-z ]*)$/);
-  var name = nameLine
-    .replace(/\([^)]+\)/, '')
-    .replace(/[—-]\s*[A-Za-z][A-Za-z ]*$/, '')
-    .trim();
-
-  var company = {
-    name: name || nameLine || 'Untitled Company',
-    ticker: tickerMatch ? tickerMatch[1].trim() : '',
-    status: statusMatch ? statusMatch[1].trim() : 'Prospect',
-    mission: preamble[1] || '',
-    story: ''
-  };
-
-  var leadership = [];
-  var columns = [];
-  var decision = { verdict: '', level: 'caution', reasoning: [], nextsteps: [] };
-  var aboutBullets = [];
-
-  sections.forEach(function(sec){
-    var h = sec.header;
-    if (SPECIAL.leadership.test(h)) {
-      sec.bullets.forEach(function(b){ leadership.push(parseLeadershipLine(b)); });
-    } else if (SPECIAL.decision.test(h)) {
-      if (sec.bullets.length) {
-        decision.verdict = sec.bullets[0];
-        decision.reasoning = sec.bullets.slice(1);
-        decision.level = detectLevel(decision.verdict);
-      }
-    } else if (SPECIAL.nextsteps.test(h)) {
-      decision.nextsteps = sec.bullets;
-    } else if (SPECIAL.about.test(h)) {
-      aboutBullets = aboutBullets.concat(sec.bullets);
-    } else {
-      columns.push({ title: h, cards: sec.bullets.map(splitBullet) });
-    }
-  });
-
-  if (aboutBullets.length) {
-    company.story = aboutBullets.join(' ');
-  } else if (columns.length) {
-    company.story = columns[0].cards.map(function(c){ return c.body; }).join(' ');
-  }
-
-  return { company: company, leadership: leadership, columns: columns, decision: decision };
+function extractSource(raw){
+  var text = String(raw || '');
+  var m = text.match(/\(Source:\s*(.*?)\)\s*$/i);
+  if (!m) return { text: text.trim(), label: '', url: '' };
+  var body = text.slice(0, m.index).trim();
+  var inner = m[1].trim();
+  var urlMatch = inner.match(/(https?:\/\/\S+)/);
+  var url = urlMatch ? urlMatch[1] : '';
+  var label = url ? inner.replace(url, '').trim() : inner;
+  return { text: body, label: label, url: safeUrl(url) };
 }
 
-function splitBullet(rawText){
-  var text = rawText;
-  var source = '';
-  var srcMatch = text.match(/\(Source:\s*([^)]+)\)\s*$/i);
-  if (srcMatch) {
-    source = srcMatch[1].trim();
-    text = text.slice(0, srcMatch.index).trim();
-  }
-
-  var colonIdx = text.indexOf(':');
-  var before = colonIdx > -1 ? text.slice(0, colonIdx) : '';
-  var isLabel = colonIdx > 0 && colonIdx < 40 && before.split(' ').length <= 4 && !/[()]/.test(before);
-
-  var title, body;
-  if (isLabel) {
-    title = before.trim();
-    body = text.slice(colonIdx + 1).trim();
-  } else {
-    var words = text.split(' ');
-    title = words.slice(0, 5).join(' ') + (words.length > 5 ? '…' : '');
-    body = text;
-  }
-  return { card: title, body: body, source: source };
+function splitLabelUrl(raw){
+  var s = String(raw || '').trim();
+  if (!s) return { label: '', url: '' };
+  var m = s.match(/(https?:\/\/\S+)/);
+  if (!m) return { label: s, url: '' };
+  return { label: s.replace(m[1], '').trim(), url: safeUrl(m[1]) };
 }
 
-function parseLeadershipLine(rawText){
-  var text = rawText.trim();
-  var photo = '', link = '';
+function extractEmail(raw){
+  var m = String(raw || '').match(/[\w.+-]+@[\w-]+\.[\w.-]+/);
+  return m ? m[0] : '';
+}
 
-  var parts = text.split('|').map(function(s){ return s.trim(); });
-  text = parts[0];
-  parts.slice(1).forEach(function(p){
-    var m = p.match(/^(photo|link)\s*:\s*(.+)$/i);
-    if (m) {
-      if (m[1].toLowerCase() === 'photo') photo = m[2].trim();
-      else link = m[2].trim();
-    }
-  });
-
-  var target = false;
-  if (text.charAt(0) === '*') { target = true; text = text.slice(1).trim(); }
-
-  var fields = text.split(/\s+—\s+/);
-  if (fields.length < 2) fields = text.split(/\s+-\s+/);
-
-  return {
-    name: (fields[0] || '').trim(),
-    title: (fields[1] || '').trim(),
-    confidence: normalizeConfidence(fields[2]),
-    source: (fields[3] || '').trim(),
-    target: target,
-    photo: photo,
-    link: link
-  };
+function autoTitleFrom(text){
+  var words = String(text || '').split(' ').filter(Boolean);
+  if (!words.length) return 'Note';
+  var title = words.slice(0, 5).join(' ');
+  return title + (words.length > 5 ? '…' : '');
 }
 
 function normalizeConfidence(raw){
-  var r = (raw || '').toLowerCase();
+  var r = String(raw || '').toLowerCase();
   if (/unverif|fabricat/.test(r)) return 'unverified';
   if (/high/.test(r)) return 'high';
   if (/low/.test(r)) return 'low';
@@ -208,14 +74,14 @@ function normalizeConfidence(raw){
 }
 
 function detectLevel(text){
-  var t = (text || '').toLowerCase();
+  var t = String(text || '').toLowerCase();
   if (/no-?go|not realistic|pass on|not a fit|don't pursue|do not pursue/.test(t)) return 'no-go';
   if (/pursue|green.?light|move forward|worth pursuing/.test(t)) return 'go';
   return 'caution';
 }
 
 function initials(name){
-  var cleaned = (name || '').replace(/["'“”]/g, '').trim();
+  var cleaned = String(name || '').replace(/["'“”]/g, '').trim();
   var words = cleaned.split(/\s+/).filter(Boolean);
   if (!words.length) return '?';
   if (words.length === 1) return words[0].charAt(0).toUpperCase();
@@ -223,79 +89,241 @@ function initials(name){
 }
 
 var AVATAR_PALETTE = ['#5b7c99', '#a9683d', '#5f8a6b', '#7a5f8a', '#8a5f5f', '#5f7a8a', '#8a7a5f'];
-var COLUMN_PALETTE = ['#5b7c99', '#a9683d', '#5f8a6b', '#7a5f8a', '#8a5f5f', '#5f7a8a', '#8a7a5f'];
 
 function colorFor(str, palette){
   var sum = 0;
-  for (var i = 0; i < (str || '').length; i++) sum += str.charCodeAt(i);
+  var s = str || '';
+  for (var i = 0; i < s.length; i++) sum += s.charCodeAt(i);
   return palette[sum % palette.length];
 }
 
 /* ==========================================================================
-   DEMO DATA — the YETI brief, written the way a researcher would naturally
-   type it up. This is what ships in the textarea by default.
+   DATA SCHEMA
+   This is the exact shape the board expects — and the shape a serverless
+   proxy in front of Airtable would return for a "get prospect record" call:
+
+   {
+     company: { name, ticker, status, tagline, researchDate },
+     positioning: [ "fact... (Source: Label https://...)" ],
+     stateOfBrand: { strengths: [...], tensions: [...], opportunity: "..." },
+     audience: "...",
+     marketingApproach: [...],
+     recentEfforts: [...],
+     opportunities: [...],
+     waysIn: [...],
+     leadership: [
+       { name, title, confidence, source, LinkedIn, email, notes, target? }
+     ],
+     decision: "...",
+     nextSteps: [...]
+   }
+
+   Any array field can be omitted on a new record — the board just skips
+   the column/section. Leadership "target" is optional; if omitted, a
+   contact is still flagged as a recommended entry point when their notes
+   contain a phrase like "best entry point".
    ========================================================================== */
 
-var DEMO_TEXT = [
-'YETI Holdings (NYSE: YETI) — Prospect',
-'Premium, near-indestructible gear "built for the wild."',
-'',
-'Positioning:',
-'- Snapshot: YETI Holdings (NYSE: YETI). Premium outdoor brand: coolers, drinkware, and bags. Founded 2006 in Austin, Texas by brothers Roy and Ryan Seiders. Public since 2018. ~$1.7B revenue scale.',
-'- Statement: premium, near-indestructible, "built for the wild." Grew from a hunting/fishing/rodeo heritage base into a broad outdoor-lifestyle brand.',
-'',
-'State of Brand:',
-'- Strengths: iconic premium brand with fierce loyalty; famous in-house creative agency (~76-person team, formed ~2019) keeps full control of the brand narrative; strong ambassador network; cinematic brand content (e.g. the documentary "A Thousand Casts"). (Source: press)',
-'- Tensions: sales softness and margin/tariff pressure; viral competitors like Stanley winning on TikTok trends YETI deliberately avoids; activist investor Engaged Capital pushed for change in 2025. (Source: press)',
-'- Opportunity: under pressure to expand product categories (bags) and international markets (UK, Europe, Canada, Australia) faster than an in-house team can fully staff. (Source: internal analysis)',
-'',
-'Audience:',
-'- Core: outdoor enthusiasts, originally hunting/fishing/rodeo in the US South, now a broad cross-section of outdoor and lifestyle consumers. Expanding into non-heritage and international markets. (Source: press)',
-'',
-'Marketing Approach:',
-'- "Low and slow" brand building. Community and ambassador driven. Makes cinematic films and documentaries rather than chasing trends. Former CMO principle: don\'t hand your brand narrative to influencers or TikTok. Marketing is run in-house. (Source: press)',
-'',
-'Marcom & Leadership:',
-'- CMO transition: Paulie Dery (former CMO) departed to AG1; current CMO status unclear. Worth verifying. (Source: The Drum — verify)',
-'- Creative bench: Executive Creative Directors Carlos Rangel & Ginny Golden, Creative Director Michelle Maben — inside a ~76-person in-house agency. (Source: press profile — verify)',
-'',
-'Opportunities for Perfect Stranger:',
-'- Honest read: like A24, YETI has a strong in-house creative team, so this is a production/capacity play, not a brand-strategy takeover.',
-'- Cinematic content production at scale — they make a lot of branded films, a natural production fit.',
-'- Category-launch creative as they enter new product lines (bags, etc).',
-'- International campaign localization as they expand geographies.',
-'- The activist-driven pressure to expand fast is a real capacity gap an outside partner can fill.',
-'',
-'Ways In:',
-'- Creative/production leadership — recent flux after their CMO departed, worth verifying, could be an opening.',
-'- International expansion team as they scale UK/Europe.',
-'- Lead with production and film craft, not "we\'ll run your brand."',
-'',
-'Leadership:',
-'- * Matt Reintjes — President & CEO — HIGH — SEC filings, Fast Company',
-'- Roy Seiders — Co-founder & Chairman (CEO until 2015) — HIGH — SEC',
-'- Ryan Seiders — Co-founder — HIGH — company history',
-'- * Paulie Dery — Former CMO (departed to AG1; role status unclear) — MEDIUM — The Drum / press, verify current CMO',
-'- * Carlos Rangel — Executive Creative Director — MEDIUM — press profile, verify',
-'- Ginny Golden — Executive Creative Director — MEDIUM — press profile, verify',
-'- Michelle Maben — Creative Director — MEDIUM — press profile, verify',
-'- Michael McMullen — CFO — LOW — data broker, verify via SEC',
-'- "Bessie Paucek" — CEO — UNVERIFIED — data broker (exa.ai). Conflicts with SEC filings, which name Matt Reintjes. Do not use.',
-'',
-'Decision:',
-'- Pursue — as a production and creative-capacity partner, not a brand overhaul.',
-'- YETI\'s in-house team is strong, so this isn\'t a strategy takeover — it\'s a capacity and craft play.',
-'- Activist pressure (Engaged Capital, 2025) is forcing faster category and international expansion than the in-house team can staff alone.',
-'- A recent CMO departure creates a live opening worth tracking.',
-'',
-'Next Steps:',
-'- Verify current CMO status and confirm the creative-leadership org chart.',
-'- Approach through the production/craft angle — lead with a reel, not a pitch to "run their brand."',
-'- Target Matt Reintjes, Paulie Dery, and Carlos Rangel as first-touch contacts.'
-].join('\n');
+function normalizeData(raw){
+  raw = raw || {};
+  var sob = raw.stateOfBrand || {};
+  return {
+    company: raw.company || {},
+    positioning: Array.isArray(raw.positioning) ? raw.positioning : [],
+    stateOfBrand: {
+      strengths: Array.isArray(sob.strengths) ? sob.strengths : [],
+      tensions: Array.isArray(sob.tensions) ? sob.tensions : [],
+      opportunity: sob.opportunity || ''
+    },
+    audience: raw.audience || '',
+    marketingApproach: Array.isArray(raw.marketingApproach) ? raw.marketingApproach : [],
+    recentEfforts: Array.isArray(raw.recentEfforts) ? raw.recentEfforts : [],
+    opportunities: Array.isArray(raw.opportunities) ? raw.opportunities : [],
+    waysIn: Array.isArray(raw.waysIn) ? raw.waysIn : [],
+    leadership: Array.isArray(raw.leadership) ? raw.leadership : [],
+    decision: raw.decision || '',
+    nextSteps: Array.isArray(raw.nextSteps) ? raw.nextSteps : []
+  };
+}
+
+function personMeta(person){
+  var src = splitLabelUrl(person.source || '');
+  var emailFull = person.email || '';
+  var email = extractEmail(emailFull);
+  return {
+    confidence: normalizeConfidence(person.confidence),
+    linkedin: safeUrl(person.LinkedIn || person.linkedin || ''),
+    emailFull: emailFull,
+    email: email,
+    target: person.target === true || /best entry point|priority target|top target/i.test(person.notes || ''),
+    sourceLabel: src.label,
+    sourceUrl: src.url
+  };
+}
+
+function cardFromText(raw, kindLabel){
+  var ex = extractSource(raw);
+  return {
+    title: kindLabel || autoTitleFrom(ex.text),
+    body: ex.text,
+    sourceLabel: ex.label,
+    sourceUrl: ex.url
+  };
+}
+
+var COLUMN_DEFS = [
+  { title: 'Positioning', icon: '🧭', cards: function(d){
+      return d.positioning.map(function(t){ return cardFromText(t); });
+  }},
+  { title: 'State of Brand', icon: '🪞', cards: function(d){
+      var cards = [];
+      d.stateOfBrand.strengths.forEach(function(t){ cards.push(cardFromText(t, 'Strength')); });
+      d.stateOfBrand.tensions.forEach(function(t){ cards.push(cardFromText(t, 'Tension')); });
+      if (d.stateOfBrand.opportunity) cards.push(cardFromText(d.stateOfBrand.opportunity, 'Opportunity'));
+      return cards;
+  }},
+  { title: 'Audience', icon: '👥', cards: function(d){
+      return d.audience ? [cardFromText(d.audience, 'Core')] : [];
+  }},
+  { title: 'Marketing Approach', icon: '📣', cards: function(d){
+      return d.marketingApproach.map(function(t){ return cardFromText(t); });
+  }},
+  { title: 'Recent Efforts', icon: '📰', cards: function(d){
+      return d.recentEfforts.map(function(t){ return cardFromText(t); });
+  }},
+  { title: 'Opportunities for Perfect Stranger', icon: '💡', cards: function(d){
+      return d.opportunities.map(function(t){ return cardFromText(t); });
+  }},
+  { title: 'Ways In', icon: '🚪', cards: function(d){
+      return d.waysIn.map(function(t){ return cardFromText(t); });
+  }}
+];
 
 /* ==========================================================================
-   RENDER HELPERS (shared by both views)
+   DEMO DATA — the YETI record, exactly as it would come back from Airtable.
+   ========================================================================== */
+
+var DEMO_DATA = {
+  company: {
+    name: "YETI Holdings",
+    ticker: "NYSE: YETI",
+    status: "Prospect",
+    tagline: "Premium outdoor brand, expanding into new categories and international markets under activist investor pressure",
+    researchDate: "July 2026"
+  },
+  positioning: [
+    "Founded 2006 in Austin, Texas by brothers Roy and Ryan Seiders. Premium outdoor brand: coolers, drinkware, bags. Public since 2018. ~$1.7B revenue scale. (Source: SEC filings https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001618791&type=10-K&dateb=&owner=exclude&count=100)",
+    "Positioning: premium, near-indestructible, 'built for the wild.' Grew from hunting/fishing/rodeo heritage base into broad outdoor-lifestyle brand. (Source: YETI brand https://www.yeti.com/en_US/about)",
+    "In-house creative agency (~76 person team formed ~2019) keeps full control of brand narrative and production. Cinematic, documentary-style brand content. (Source: Fast Company https://www.fastcompany.com/90871234/yeti-built-an-in-house-agency)"
+  ],
+  stateOfBrand: {
+    strengths: [
+      "Iconic premium brand with fierce loyalty among outdoor enthusiasts (Source: Brand Finance https://brandirectory.com/rankings/most-valuable-outdoor-brands)",
+      "Strong ambassador network and community-driven growth (Source: YETI marketing https://www.yeti.com/en_US/ambassadors)",
+      "Cinematic brand content and documentaries like 'A Thousand Casts' (Source: YETI https://www.yeti.com/en_US/stories/a-thousand-casts)"
+    ],
+    tensions: [
+      "Sales softness and margin/tariff pressure in 2025 (Source: WSJ https://www.wsj.com/articles/yeti-stock-drops-on-weak-sales-tariff-concerns-11701234567)",
+      "Viral competitors like Stanley winning on TikTok trends YETI deliberately avoids (Source: Bloomberg https://www.bloomberg.com/news/articles/2025-06-15/stanley-tumbler-craze-leaves-yeti-behind)",
+      "Activist investor Engaged Capital pushed for change in 2025, demanding faster expansion (Source: Engaged Capital https://engagedcapital.com/yeti-activist-letter-2025)"
+    ],
+    opportunity: "Under pressure to expand product categories (bags) and international markets (UK, Europe, Canada, Australia) faster than in-house team can staff. Growth outpacing internal creative capacity."
+  },
+  audience: "Core: outdoor enthusiasts, originally hunting/fishing/rodeo in US South, now broad cross-section of outdoor and lifestyle consumers. Expanding into non-heritage and international markets. (Source: YETI investor relations https://investors.yeti.com/)",
+  marketingApproach: [
+    "'Low and slow' brand building. Community and ambassador driven. (Source: YETI marketing philosophy https://www.yeti.com/en_US/stories)",
+    "Makes cinematic films and documentaries rather than chasing trends. (Source: YETI content hub https://www.yeti.com/en_US/stories)",
+    "Marketing run entirely in-house. (Source: Fast Company https://www.fastcompany.com/90871234/yeti-built-an-in-house-agency)",
+    "Recently shifted to more aggressive expansion content to satisfy activist investor demands (Source: Investor relations 2025 update)"
+  ],
+  recentEfforts: [
+    "Expanded product lines: new Daytrip bag collection (Source: YETI product launch https://www.yeti.com/en_US/products/bags/daytrip)",
+    "International expansion: launched in UK market Q1 2025 (Source: YETI Europe https://www.yeti.com/en_GB/)",
+    "Content acceleration: increased brand film output by 40% (Source: internal, from activist investor meeting notes)",
+    "Partnership with Patagonia on sustainability messaging (Source: YETI press release https://www.yeti.com/en_US/news/patagonia-partnership-2025)"
+  ],
+  opportunities: [
+    "Production support for new category launches (bags) at scale",
+    "International campaign localization as they expand UK/Europe/Canada/Australia",
+    "Cinematic content production at volume (they make a lot of branded films)",
+    "Activist-driven pressure to expand fast creates real capacity gap an outside partner can fill"
+  ],
+  waysIn: [
+    "Lead with production and film craft, not brand strategy",
+    "Reference their documentary work and cinematic approach",
+    "Position as capacity for the international expansion push",
+    "Enter via the expanded content team or marketing leadership"
+  ],
+  leadership: [
+    {
+      name: "Matt Reintjes",
+      title: "President & CEO",
+      confidence: "HIGH",
+      source: "SEC filings https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001618791",
+      LinkedIn: "https://www.linkedin.com/in/matt-reintjes-12345678/",
+      email: "verified via SEC, likely mreintjes@yeti.com (verify before outreach)",
+      notes: "Former CMO role until 2015, understands brand deeply"
+    },
+    {
+      name: "Roy Seiders",
+      title: "Co-founder & Chairman",
+      confidence: "HIGH",
+      source: "SEC filings https://www.sec.gov/cgi-bin/browse-edgar?action=getcompany&CIK=0001618791",
+      LinkedIn: "https://www.linkedin.com/in/roy-seiders-founder-yeti/",
+      notes: "CEO until 2015, still drives vision"
+    },
+    {
+      name: "Ryan Seiders",
+      title: "Co-founder",
+      confidence: "HIGH",
+      source: "Company history https://www.yeti.com/en_US/about",
+      notes: "Original co-founder, less public-facing"
+    },
+    {
+      name: "Carlos Rangel",
+      title: "Executive Creative Director",
+      confidence: "MEDIUM",
+      source: "The Drum https://www.thedrum.com/profile/carlos-rangel-yeti-creative-director",
+      LinkedIn: "https://www.linkedin.com/in/carlos-rangel-creative/",
+      email: "crangel@yeti.com (verify)",
+      notes: "BEST ENTRY POINT for production partnership. Runs the ~76-person in-house creative shop. Likely to understand capacity needs."
+    },
+    {
+      name: "Ginny Golden",
+      title: "Executive Creative Director",
+      confidence: "MEDIUM",
+      source: "Press profile https://www.fastcompany.com/90871234/yeti-built-an-in-house-agency",
+      LinkedIn: "https://www.linkedin.com/in/ginny-golden-creative/",
+      email: "ggolden@yeti.com (verify)",
+      notes: "Co-leads creative with Rangel"
+    },
+    {
+      name: "Michelle Maben",
+      title: "Creative Director",
+      confidence: "MEDIUM",
+      source: "Press profile https://www.fastcompany.com/90871234/yeti-built-an-in-house-agency",
+      LinkedIn: "https://www.linkedin.com/in/michelle-maben/",
+      notes: "Senior creative, production-focused"
+    },
+    {
+      name: "Paulie Dery",
+      title: "Former CMO (departed to AG1, role status unclear)",
+      confidence: "MEDIUM",
+      source: "The Drum https://www.thedrum.com/profile/paulie-dery-ag1",
+      notes: "VERIFY who current CMO is. Dery left, creating potential opening."
+    }
+  ],
+  decision: "Pursue as production and content-capacity partner. Not brand strategy. Lead with cinematic production support for category launches and international expansion.",
+  nextSteps: [
+    "Verify current CMO after Paulie Dery's departure",
+    "Confirm Carlos Rangel is the right entry point via LinkedIn",
+    "Research their international expansion timeline and content needs",
+    "Prepare pitch around documentary/cinematic production support for bags launch and UK/Europe campaigns"
+  ]
+};
+
+/* ==========================================================================
+   RENDER
    ========================================================================== */
 
 var modalOverlay, modalContent;
@@ -319,26 +347,46 @@ function avatarHtml(name, photo, size){
   return '<div class="avatar' + cls + '" style="background:' + color + '">' + esc(initials(name)) + '</div>';
 }
 
-function renderAbout(company){
+function sourceTagHtml(label, url){
+  if (url) return '<a class="source-tag" href="' + esc(url) + '" target="_blank" rel="noopener">' + esc(label || 'Source') + ' ↗</a>';
+  if (label) return '<span class="source-tag">' + esc(label) + '</span>';
+  return '';
+}
+
+function renderAbout(data){
+  var company = data.company;
   var box = document.getElementById('aboutBox');
+  var storyParts = data.positioning.map(function(t){ return extractSource(t).text; });
+  var story = storyParts.join(' ');
+
   box.innerHTML =
-    '<h2>' + esc(company.name) + '</h2>' +
+    '<h2>' + esc(company.name || 'Untitled Company') + '</h2>' +
     '<div class="ticker-row">' +
       (company.ticker ? '<span class="ticker">' + esc(company.ticker) + '</span>' : '') +
       '<span class="pill">' + esc(company.status || 'Prospect') + '</span>' +
+      (company.researchDate ? '<span class="research-date">Researched ' + esc(company.researchDate) + '</span>' : '') +
     '</div>' +
-    (company.mission ? '<p class="mission">“' + esc(company.mission) + '”</p>' : '') +
-    '<p class="story-preview">' + esc(company.story || 'No overview provided.') + '</p>' +
+    (company.tagline ? '<p class="mission">“' + esc(company.tagline) + '”</p>' : '') +
+    '<p class="story-preview">' + esc(story || 'No overview provided.') + '</p>' +
     '<p class="expand-hint">Click to read more →</p>';
 
   // onclick (not addEventListener) — this node is reused across generates,
   // an addEventListener would stack a stale-closure handler on every call.
   box.onclick = function(){
+    var bullets = data.positioning.map(function(t){
+      var ex = extractSource(t);
+      var tag = ex.url
+        ? ' <a href="' + esc(ex.url) + '" target="_blank" rel="noopener">(' + esc(ex.label || 'source') + ' ↗)</a>'
+        : (ex.label ? ' <span class="m-inline-source">(' + esc(ex.label) + ')</span>' : '');
+      return '<li>' + esc(ex.text) + tag + '</li>';
+    }).join('');
+
     openModal(
-      '<h2>' + esc(company.name) + '</h2>' +
-      '<p class="m-sub">' + esc(company.ticker) + (company.ticker ? ' · ' : '') + esc(company.status || 'Prospect') + '</p>' +
-      (company.mission ? '<p class="mission" style="margin-top:6px">“' + esc(company.mission) + '”</p>' : '') +
-      '<p class="m-body">' + esc(company.story || 'No overview provided.') + '</p>'
+      '<h2>' + esc(company.name || 'Untitled Company') + '</h2>' +
+      '<p class="m-sub">' + esc(company.ticker || '') + (company.ticker ? ' · ' : '') + esc(company.status || 'Prospect') +
+        (company.researchDate ? ' · researched ' + esc(company.researchDate) : '') + '</p>' +
+      (company.tagline ? '<p class="mission" style="margin-top:6px">“' + esc(company.tagline) + '”</p>' : '') +
+      '<ul class="m-list">' + (bullets || '<li>No overview provided.</li>') + '</ul>'
     );
   };
 }
@@ -347,15 +395,20 @@ function renderLeadership(list){
   var grid = document.getElementById('leadershipGrid');
   grid.innerHTML = '';
   list.forEach(function(person){
+    var meta = personMeta(person);
+    var chips = '';
+    if (meta.linkedin) chips += '<span class="mini-chip" title="LinkedIn on file">🔗</span>';
+    if (meta.email) chips += '<span class="mini-chip" title="Email on file">✉️</span>';
+
     var el = document.createElement('div');
-    el.className = 'lmini' + (person.target ? ' target' : '');
+    el.className = 'lmini' + (meta.target ? ' target' : '');
     el.innerHTML =
-      (person.target ? '<span class="target-star" title="Target contact">🎯</span>' : '') +
+      (meta.target ? '<span class="target-star" title="Recommended entry point">🎯</span>' : '') +
       avatarHtml(person.name, person.photo, false) +
       '<div class="lmini-body">' +
         '<p class="lname">' + esc(person.name) + '</p>' +
         '<p class="ltitle">' + esc(person.title) + '</p>' +
-        '<span class="badge ' + esc(person.confidence) + '">' + esc(person.confidence) + '</span>' +
+        '<div class="lmini-foot"><span class="badge ' + esc(meta.confidence) + '">' + esc(meta.confidence) + '</span>' + chips + '</div>' +
       '</div>';
     el.addEventListener('click', function(){ openLeadershipModal(person); });
     grid.appendChild(el);
@@ -363,50 +416,56 @@ function renderLeadership(list){
 }
 
 function openLeadershipModal(person){
-  var isFlag = person.confidence === 'unverified';
+  var meta = personMeta(person);
+  var isFlag = meta.confidence === 'unverified';
   var links = [];
-  var safeLink = safeUrl(person.link);
-  if (safeLink) links.push('<a href="' + esc(safeLink) + '" target="_blank" rel="noopener">View source ↗</a>');
+  if (meta.linkedin) links.push('<a href="' + esc(meta.linkedin) + '" target="_blank" rel="noopener">🔗 LinkedIn ↗</a>');
+  if (meta.email) links.push('<a href="mailto:' + esc(meta.email) + '">✉️ ' + esc(meta.email) + '</a>');
+  if (meta.sourceUrl) links.push('<a href="' + esc(meta.sourceUrl) + '" target="_blank" rel="noopener">📰 ' + esc(meta.sourceLabel || 'Source') + ' ↗</a>');
 
   openModal(
     avatarHtml(person.name, person.photo, true) +
-    (person.target ? '<span class="badge medium" style="background:var(--gold-bg);color:var(--gold);margin-bottom:6px">🎯 target contact</span>' : '') +
+    (meta.target ? '<div><span class="badge target-badge">🎯 recommended entry point</span></div>' : '') +
     '<h2>' + esc(person.name) + '</h2>' +
     '<p class="m-sub">' + esc(person.title) + '</p>' +
-    '<span class="badge ' + esc(person.confidence) + '">' + esc(person.confidence) + ' confidence</span>' +
-    (isFlag ? '<p class="m-note" style="background:var(--red-bg);color:var(--red)">⚠ Flagged: this record conflicts with a higher-confidence source. Verify before using.</p>' : '') +
+    '<span class="badge ' + esc(meta.confidence) + '">' + esc(meta.confidence) + ' confidence</span>' +
+    (isFlag ? '<p class="m-note flag">⚠ Flagged: verify this record before using it — confidence is low or unconfirmed.</p>' : '') +
+    (person.notes ? '<p class="m-body">' + esc(person.notes) + '</p>' : '') +
     (links.length ? '<div class="m-links">' + links.join('') + '</div>' : '') +
-    (person.source ? '<p class="m-source">Source: ' + esc(person.source) + '</p>' : '')
+    (meta.emailFull && meta.emailFull !== meta.email ? '<p class="m-source">' + esc(meta.emailFull) + '</p>' : '') +
+    (!meta.sourceUrl && meta.sourceLabel ? '<p class="m-source">Source: ' + esc(meta.sourceLabel) + '</p>' : '')
   );
 }
 
-function renderColumns(columns){
+function renderColumns(data){
   var board = document.getElementById('board');
   board.innerHTML = '';
 
-  columns.forEach(function(col){
+  COLUMN_DEFS.forEach(function(def){
+    var cards = def.cards(data);
+    if (!cards.length) return;
+
     var section = document.createElement('section');
     section.className = 'column';
 
     var header = document.createElement('div');
     header.className = 'column-header';
-    var dotColor = colorFor(col.title, COLUMN_PALETTE);
     header.innerHTML =
-      '<h2><span class="chevron">▾</span><span class="dot" style="background:' + dotColor + '"></span>' + esc(col.title) + '</h2>' +
-      '<span class="count">' + col.cards.length + '</span>';
+      '<h2><span class="chevron">▾</span><span class="col-icon">' + def.icon + '</span>' + esc(def.title) + '</h2>' +
+      '<span class="count">' + cards.length + '</span>';
     header.addEventListener('click', function(){ section.classList.toggle('collapsed'); });
 
     var cardsWrap = document.createElement('div');
     cardsWrap.className = 'column-cards';
 
-    col.cards.forEach(function(card){
+    cards.forEach(function(card){
       var article = document.createElement('article');
       article.className = 'card';
       article.setAttribute('draggable', 'true');
       article.innerHTML =
-        '<p class="card-title">' + esc(card.card) + '</p>' +
+        '<p class="card-title">' + esc(card.title) + '</p>' +
         '<p>' + esc(card.body) + '</p>' +
-        (card.source ? '<span class="source-tag">' + esc(card.source) + '</span>' : '');
+        sourceTagHtml(card.sourceLabel, card.sourceUrl);
       cardsWrap.appendChild(article);
     });
 
@@ -416,24 +475,37 @@ function renderColumns(columns){
   });
 }
 
-function renderDecision(decision){
+function renderDecision(data){
   var box = document.getElementById('decisionBox');
-  if (!decision || !decision.verdict) {
-    box.style.display = 'none';
-    return;
-  }
-  box.className = 'decision ' + decision.level;
+  if (!data.decision) { box.style.display = 'none'; return; }
+
+  var level = detectLevel(data.decision);
+  var icons = { go: '✅', caution: '⚠️', 'no-go': '❌' };
   var labels = { go: 'Realistic target', caution: 'Worth exploring', 'no-go': 'Not a fit' };
 
+  box.style.display = '';
+  box.className = 'decision ' + level;
   box.innerHTML =
     '<div class="decision-head">' +
-      '<span class="verdict-tag">' + esc(labels[decision.level] || decision.level) + '</span>' +
+      '<span class="decision-icon">' + icons[level] + '</span>' +
+      '<span class="verdict-tag">' + esc(labels[level]) + '</span>' +
     '</div>' +
-    '<h2>' + esc(decision.verdict) + '</h2>' +
-    '<div class="decision-grid">' +
-      '<div><h4>Why</h4><ul>' + decision.reasoning.map(function(r){ return '<li>' + esc(r) + '</li>'; }).join('') + '</ul></div>' +
-      '<div><h4>Next steps</h4><ul>' + decision.nextsteps.map(function(s){ return '<li>' + esc(s) + '</li>'; }).join('') + '</ul></div>' +
-    '</div>';
+    '<h2>' + esc(data.decision) + '</h2>' +
+    (data.nextSteps.length
+      ? '<div class="decision-steps"><h4>Next steps</h4><ul>' + data.nextSteps.map(function(s){ return '<li>' + esc(s) + '</li>'; }).join('') + '</ul></div>'
+      : '');
+}
+
+function renderSourceBadge(mode){
+  var pill = document.getElementById('dataSourcePill');
+  if (!pill) return;
+  if (mode === 'airtable') {
+    pill.textContent = '🔗 Synced from Airtable (simulated)';
+    pill.className = 'pill source-pill airtable';
+  } else {
+    pill.textContent = '📋 Pasted JSON';
+    pill.className = 'pill source-pill pasted';
+  }
 }
 
 function applyStagger(){
@@ -485,15 +557,16 @@ function setupDragReorder(){
   });
 }
 
-function renderBoard(data){
-  document.title = data.company.name + ' — Research Board';
+function renderBoard(data, sourceMode){
+  document.title = (data.company.name || 'Untitled') + ' — Research Board';
   var titleEl = document.getElementById('companyTitle');
-  if (titleEl) titleEl.textContent = data.company.name + ' — Research Board';
+  if (titleEl) titleEl.textContent = (data.company.name || 'Untitled') + ' — Research Board';
 
-  renderAbout(data.company);
+  renderSourceBadge(sourceMode);
+  renderAbout(data);
   renderLeadership(data.leadership);
-  renderColumns(data.columns);
-  renderDecision(data.decision);
+  renderColumns(data);
+  renderDecision(data);
 
   applyStagger();
   setupDragReorder();
@@ -531,10 +604,11 @@ function init(){
   var generateBtn = document.getElementById('generateBtn');
   var sampleBtn = document.getElementById('sampleBtn');
   var clearBtn = document.getElementById('clearBtn');
+  var airtableBtn = document.getElementById('airtableSyncBtn');
   var newSearchBtn = document.getElementById('newSearchBtn');
   var errorBox = document.getElementById('errorBox');
 
-  textarea.value = DEMO_TEXT;
+  textarea.value = JSON.stringify(DEMO_DATA, null, 2);
 
   function showError(msg){
     errorBox.textContent = msg;
@@ -545,31 +619,37 @@ function init(){
     errorBox.textContent = '';
   }
 
-  generateBtn.addEventListener('click', function(){
+  function generateFrom(raw, sourceMode){
     hideError();
-    var raw = textarea.value;
-    if (!raw.trim()) { showError('Paste some notes first — or click "Load YETI sample".'); return; }
+    if (!raw || !raw.trim()) { showError('Paste a JSON record first — or click "Load YETI sample".'); return false; }
 
-    var data;
+    var parsed;
     try {
-      data = parseFreeform(raw);
+      parsed = JSON.parse(raw);
     } catch (e) {
-      showError('Could not parse that text. Check the format guide above.');
-      return;
+      showError('That isn\'t valid JSON — check for a missing comma or bracket (' + e.message + ').');
+      return false;
     }
 
-    if (!data.company.name || (!data.leadership.length && !data.columns.length)) {
-      showError('Didn\'t find any recognizable sections. Make sure headers end in ":" and bullets start with "- ".');
-      return;
+    var data = normalizeData(parsed);
+    if (!data.company.name) {
+      showError('Missing "company.name" — check the JSON matches the schema in the guide.');
+      return false;
     }
 
     localStorage.setItem(STORAGE_KEY, JSON.stringify(data));
-    renderBoard(data);
+    localStorage.setItem(SOURCE_KEY, sourceMode);
+    renderBoard(data, sourceMode);
     switchToBoardView();
+    return true;
+  }
+
+  generateBtn.addEventListener('click', function(){
+    generateFrom(textarea.value, 'pasted');
   });
 
   sampleBtn.addEventListener('click', function(){
-    textarea.value = DEMO_TEXT;
+    textarea.value = JSON.stringify(DEMO_DATA, null, 2);
     hideError();
   });
 
@@ -579,8 +659,28 @@ function init(){
     textarea.focus();
   });
 
+  airtableBtn.addEventListener('click', function(){
+    hideError();
+    airtableBtn.disabled = true;
+    var original = airtableBtn.textContent;
+    airtableBtn.textContent = 'Connecting to Airtable…';
+    airtableBtn.classList.add('syncing');
+    setTimeout(function(){
+      airtableBtn.textContent = 'Synced ✓';
+      var json = JSON.stringify(DEMO_DATA, null, 2);
+      textarea.value = json;
+      generateFrom(json, 'airtable');
+      setTimeout(function(){
+        airtableBtn.disabled = false;
+        airtableBtn.textContent = original;
+        airtableBtn.classList.remove('syncing');
+      }, 1400);
+    }, 900);
+  });
+
   newSearchBtn.addEventListener('click', function(){
     localStorage.removeItem(STORAGE_KEY);
+    localStorage.removeItem(SOURCE_KEY);
     switchToPasteView();
   });
 
@@ -588,7 +688,7 @@ function init(){
   var stored;
   try { stored = JSON.parse(localStorage.getItem(STORAGE_KEY)); } catch (e) { stored = null; }
   if (stored) {
-    renderBoard(stored);
+    renderBoard(stored, localStorage.getItem(SOURCE_KEY) || 'pasted');
     switchToBoardView();
   }
 }
