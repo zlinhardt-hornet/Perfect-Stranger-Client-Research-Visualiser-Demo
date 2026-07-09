@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Research Board Generator</title>
+<link rel="icon" href="data:image/svg+xml,<svg xmlns=%22http://www.w3.org/2000/svg%22 viewBox=%220 0 100 100%22><text y=%22.9em%22 font-size=%2290%22>🗂️</text></svg>">
+<link rel="stylesheet" href="assets/style.css">
+</head>
+<body>
+
+  <div class="modal-overlay" id="modalOverlay">
+    <div class="modal" id="modalContent"></div>
+  </div>
+
+  <!-- ============ PASTE VIEW ============ -->
+  <div id="pasteView">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1>Research Board Generator</h1>
+        <p class="mock-note">Client research, structured on load. Same JSON contract a live Airtable API would return.</p>
+      </div>
+    </header>
+
+    <section class="hero">
+      <h1>Load a research record</h1>
+      <p>Paste a record in the fixed JSON shape below — the sample is YETI's real record. Swap in a different company's JSON any time to visualize a new target, or click <strong>Sync from Airtable</strong> to see how the connected version would feel.</p>
+    </section>
+
+    <main class="paste-panel">
+
+      <div class="source-row">
+        <button class="primary" id="airtableSyncBtn" type="button">🔗 Sync from Airtable (demo)</button>
+        <span class="source-row-note">Simulated — no live Airtable connection in this demo. See "For IT/Data" below.</span>
+      </div>
+
+      <details class="format-guide">
+        <summary>JSON schema</summary>
+        <p>Every field below is optional except <code>company.name</code> — omit a section on a new record and the board just skips that column.</p>
+        <pre>{
+  "company": { "name": "", "ticker": "", "status": "Prospect",
+               "tagline": "", "researchDate": "" },
+  "positioning": [ "fact... (Source: Label https://...)" ],
+  "stateOfBrand": {
+    "strengths": [ "..." ], "tensions": [ "..." ], "opportunity": ""
+  },
+  "audience": "",
+  "marketingApproach": [ "..." ],
+  "recentEfforts": [ "..." ],
+  "opportunities": [ "..." ],
+  "waysIn": [ "..." ],
+  "leadership": [
+    { "name": "", "title": "", "confidence": "HIGH|MEDIUM|LOW|UNVERIFIED",
+      "source": "Label https://...", "LinkedIn": "https://...",
+      "email": "person@company.com", "notes": "", "target": false }
+  ],
+  "decision": "",
+  "nextSteps": [ "..." ]
+}</pre>
+        <ul>
+          <li>Any fact string can end with <code>(Source: Label https://...)</code> — it renders as a clickable citation. Leave the URL off for a plain, non-linked source tag.</li>
+          <li>A leadership record is flagged as a 🎯 <strong>recommended entry point</strong> if <code>target</code> is <code>true</code>, or automatically if their <code>notes</code> mentions "best entry point".</li>
+          <li>Confidence just needs to contain <code>high</code>, <code>medium</code>, <code>low</code>, or <code>unverified</code> (any case).</li>
+          <li>The decision box color is picked up from the wording in <code>decision</code> — "pursue" → green, "pass" / "not a fit" → red, anything else → amber.</li>
+        </ul>
+      </details>
+
+      <details class="format-guide">
+        <summary>For IT / Data: how this connects to Airtable</summary>
+        <ul>
+          <li>The JSON above <strong>is</strong> the data contract — it's exactly what this page needs, and exactly what an Airtable base could hand back.</li>
+          <li>Production shape: one Airtable base, one table per prospect record, with a linked "Leadership" table (rows → the <code>leadership[]</code> array).</li>
+          <li>Airtable's REST API needs a server-side API key — never exposed in this static frontend. A thin serverless function (Vercel/Cloudflare Worker/Lambda) would call Airtable, reshape the response into this exact JSON, and hand it to the browser.</li>
+          <li>This page's renderer doesn't change either way — it already consumes this shape. Swapping the paste box for a <code>fetch('/api/prospect/yeti')</code> call is the only change needed to go live.</li>
+          <li>The "Sync from Airtable" button above simulates that call (fixed delay, same YETI record) so the interaction pattern is demonstrable today without the integration built yet.</li>
+        </ul>
+      </details>
+
+      <textarea id="pasteInput" spellcheck="false"></textarea>
+
+      <div class="actions">
+        <button class="primary" id="generateBtn">Generate board →</button>
+        <button class="ghost" id="sampleBtn">Load YETI sample</button>
+        <button class="link-btn" id="clearBtn">Clear</button>
+      </div>
+
+      <div class="error-box" id="errorBox"></div>
+
+    </main>
+
+    <footer>
+      Demo. In the live version, the paste box is replaced by a live Airtable API call — everything downstream of the JSON is identical.
+    </footer>
+
+  </div>
+
+  <!-- ============ BOARD VIEW ============ -->
+  <div id="boardView" style="display:none">
+
+    <header class="topbar">
+      <div class="topbar-left">
+        <h1 id="companyTitle">Research Board</h1>
+        <p class="mock-note">
+          <span class="pill source-pill" id="dataSourcePill">📋 Pasted JSON</span>
+          Demo — in the live version this record would be fetched live from Airtable.
+        </p>
+      </div>
+      <div class="topbar-right">
+        <button class="ghost-link" id="newSearchBtn" type="button">← New search</button>
+      </div>
+    </header>
+
+    <p class="hint">Click the about box or a leadership card for details. Click a column title to collapse it. Drag cards to reorder within a column.</p>
+
+    <section class="legend">
+      <span class="legend-item"><span class="legend-dot high"></span> High confidence</span>
+      <span class="legend-item"><span class="legend-dot medium"></span> Medium</span>
+      <span class="legend-item"><span class="legend-dot low"></span> Low / unverified</span>
+      <span class="legend-item"><span class="legend-dot target"></span> 🎯 Recommended entry point</span>
+    </section>
+
+    <section class="top-panel">
+      <article class="about-box" id="aboutBox"></article>
+      <aside class="leadership-panel">
+        <h3>Leadership</h3>
+        <p class="sub">Target contacts are highlighted — click any card for LinkedIn, email, and sourcing.</p>
+        <div class="leadership-mini-grid" id="leadershipGrid"></div>
+      </aside>
+    </section>
+
+    <main class="board" id="board"></main>
+
+    <section class="decision" id="decisionBox"></section>
+
+    <footer>
+      Mock. In the live version, this entire record — columns, leadership, decision — would populate from an Airtable base via API. No Airtable connection is used here.
+    </footer>
+
+  </div>
+
+  <script src="assets/app.js"></script>
+</body>
+</html>
