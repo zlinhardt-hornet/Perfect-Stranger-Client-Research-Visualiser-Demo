@@ -1,4 +1,4 @@
-# Research Board Generator (demo)
+# Perfect Stranger Client Research Board Generator (demo)
 
 Paste research notes → get a structured client research board, right there on the same page. Single-page app, pure static site — no backend, no build step, no API key.
 
